@@ -32,18 +32,18 @@
 -export([subcluster_nodes/1]).
 -export([join/4]).
 -export([leave/3]).
--export([members/2]).
+-export([members/2, members/3]).
 -export([member/3]).
 -export([member_count/2, member_count/3]).
 -export([is_member/3]).
 -export([update_member/4]).
--export([local_members/2]).
+-export([local_members/2, local_members/3]).
 -export([is_local_member/3]).
 -export([count/1, count/2]).
 -export([group_names/1, group_names/2]).
--export([publish/3]).
--export([local_publish/3]).
--export([multi_call/4, multi_call_reply/2]).
+-export([publish/3, publish/4]).
+-export([local_publish/3, local_publish/4]).
+-export([multi_call/4, multi_call/5, multi_call_reply/2]).
 
 %% syn_gen_scope callbacks
 -export([
@@ -84,6 +84,10 @@ subcluster_nodes(Scope) ->
 -spec members(Scope :: atom(), GroupName :: term()) -> [{Pid :: pid(), Meta :: term()}].
 members(Scope, GroupName) ->
     do_get_members(Scope, GroupName, undefined, undefined).
+
+-spec members(Scope :: atom(), GroupName :: term(), Guards :: list()) -> [{Pid :: pid(), Meta :: term()}].
+members(Scope, GroupName, Guards) ->
+    do_get_members(Scope, GroupName, undefined, undefined, Guards).
 
 -spec member(Scope :: atom(), GroupName :: term(), pid()) -> {pid(), Meta :: term()} | undefined.
 member(Scope, GroupName, Pid) ->
@@ -130,6 +134,10 @@ is_member(Scope, GroupName, Pid) ->
 local_members(Scope, GroupName) ->
     do_get_members(Scope, GroupName, undefined, node()).
 
+-spec local_members(Scope :: atom(), GroupName :: term(), Guards :: list()) -> [{pid(), Meta :: term()}].
+local_members(Scope, GroupName, Guards) ->
+    do_get_members(Scope, GroupName, undefined, node(), Guards).
+
 -spec do_get_members(Scope :: atom(), GroupName :: term(), pid() | undefined, Node :: node() | undefined) ->
     [{pid(), Meta :: term()}].
 do_get_members(Scope, GroupName, Pid, Node) ->
@@ -149,6 +157,29 @@ do_get_members(Scope, GroupName, Pid, Node) ->
             ets:select(TableByName, [{
                 {{GroupName, PidParam}, '$3', '_', '_', NodeParam},
                 [],
+                [{{PidParam, '$3'}}]
+            }])
+    end.
+
+-spec do_get_members(Scope :: atom(), GroupName :: term(), pid() | undefined, Node :: node() | undefined, Guards :: list()) ->
+    [{pid(), Meta :: term()}].
+do_get_members(Scope, GroupName, Pid, Node, Guards) ->
+    PidParam = case Pid of
+        undefined -> '$2';
+        _ -> Pid
+    end,
+    NodeParam = case Node of
+        undefined -> '_';
+        _ -> Node
+    end,
+    case syn_backbone:get_table_name(syn_pg_by_name, Scope) of
+        undefined ->
+            error({invalid_scope, Scope});
+
+        TableByName ->
+            ets:select(TableByName, [{
+                {{GroupName, PidParam}, '$3', '_', '_', NodeParam},
+                Guards,
                 [{{PidParam, '$3'}}]
             }])
     end.
@@ -276,9 +307,19 @@ publish(Scope, GroupName, Message) ->
     Members = members(Scope, GroupName),
     do_publish(Members, Message).
 
+-spec publish(Scope :: atom(), GroupName :: term(), Message :: term(), Guards :: list()) -> {ok, RecipientCount :: non_neg_integer()}.
+publish(Scope, GroupName, Message, Guards) ->
+    Members = members(Scope, GroupName, Guards),
+    do_publish(Members, Message).
+
 -spec local_publish(Scope :: atom(), GroupName :: term(), Message :: term()) -> {ok, RecipientCount :: non_neg_integer()}.
 local_publish(Scope, GroupName, Message) ->
     Members = local_members(Scope, GroupName),
+    do_publish(Members, Message).
+
+-spec local_publish(Scope :: atom(), GroupName :: term(), Message :: term(), Guards :: list()) -> {ok, RecipientCount :: non_neg_integer()}.
+local_publish(Scope, GroupName, Message, Guards) ->
+    Members = local_members(Scope, GroupName, Guards),
     do_publish(Members, Message).
 
 -spec do_publish(Members :: [{Pid :: pid(), Meta :: term()}], Message :: term()) ->
@@ -297,6 +338,19 @@ do_publish(Members, Message) ->
 multi_call(Scope, GroupName, Message, Timeout) ->
     Self = self(),
     Members = members(Scope, GroupName),
+    lists:foreach(fun({Pid, Meta}) ->
+        spawn_link(?MODULE, multi_call_and_receive, [Self, Pid, Meta, Message, Timeout])
+    end, Members),
+    collect_replies(orddict:from_list(Members)).
+
+-spec multi_call(Scope :: atom(), GroupName :: term(), Message :: term(), Timeout :: non_neg_integer(), Guards :: list()) ->
+    {
+        Replies :: [{{pid(), Meta :: term()}, Reply :: term()}],
+        BadReplies :: [{pid(), Meta :: term()}]
+    }.
+multi_call(Scope, GroupName, Message, Timeout, Guards) ->
+    Self = self(),
+    Members = members(Scope, GroupName, Guards),
     lists:foreach(fun({Pid, Meta}) ->
         spawn_link(?MODULE, multi_call_and_receive, [Self, Pid, Meta, Message, Timeout])
     end, Members),
